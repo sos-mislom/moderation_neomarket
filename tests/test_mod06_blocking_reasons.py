@@ -7,6 +7,9 @@ import pytest
 from moderation.models import BlockingReason, ModerationCard
 
 
+OPENAPI_REASON_FIELDS = {"id", "code", "title", "hard_block", "is_active"}
+
+
 @pytest.mark.django_db
 def test_list_returns_active_reasons(client) -> None:
     response = client.get("/api/v1/product-blocking-reasons")
@@ -16,6 +19,21 @@ def test_list_returns_active_reasons(client) -> None:
     assert len(payload) >= 10
     assert {"id", "title", "hard_block"} <= set(payload[0])
     assert all(item["is_active"] is True for item in payload)
+
+
+@pytest.mark.django_db
+def test_protocol_path_returns_blocking_reason_response_shape(client) -> None:
+    response = client.get("/api/v1/blocking-reasons")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload
+    assert OPENAPI_REASON_FIELDS <= set(payload[0])
+    assert isinstance(payload[0]["id"], str)
+    assert isinstance(payload[0]["code"], str)
+    assert isinstance(payload[0]["title"], str)
+    assert isinstance(payload[0]["hard_block"], bool)
+    assert isinstance(payload[0]["is_active"], bool)
 
 
 @pytest.mark.django_db
@@ -32,6 +50,22 @@ def test_inactive_reasons_not_visible(client) -> None:
     assert response.status_code == 200
     ids = {item["id"] for item in response.json()}
     assert str(inactive.id) not in ids
+
+
+@pytest.mark.django_db
+def test_inactive_reasons_visible_only_when_requested(client) -> None:
+    inactive = BlockingReason.objects.create(
+        code="ARCHIVED_REASON",
+        title="Архивная причина",
+        hard_block=False,
+        is_active=False,
+    )
+
+    response = client.get("/api/v1/blocking-reasons?is_active=false")
+
+    assert response.status_code == 200
+    ids = {item["id"] for item in response.json()}
+    assert str(inactive.id) in ids
 
 
 @pytest.mark.django_db

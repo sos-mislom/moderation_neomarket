@@ -12,7 +12,7 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
-from .models import BlockingReason, ModerationCard, OutgoingModerationEvent
+from .models import BlockingReason, IncomingProductEvent, ModerationCard, OutgoingModerationEvent
 
 
 CODE_RE = re.compile(r"^[A-Z_]+$")
@@ -157,7 +157,7 @@ def approve_card(request: HttpRequest, *, ticket_id=None, product_id=None, proto
     if card is None:
         return error(404, "NOT_FOUND", "Product not found in moderation queue")
     if card.status == ModerationCard.Status.HARD_BLOCKED:
-        return error(409, "HARD_BLOCKED", "Product is permanently blocked")
+        return error(403, "HARD_BLOCKED", "Product is permanently blocked")
     if card.status != ModerationCard.Status.IN_REVIEW:
         return error(409, "INVALID_STATUS", "Product is not in review status")
     if card.assigned_moderator_id != moderator_id:
@@ -213,6 +213,181 @@ def approve_card(request: HttpRequest, *, ticket_id=None, product_id=None, proto
         return error(500, "B2B_EVENT_FAILED", "Could not deliver moderation decision to B2B")
 
     return JsonResponse(ticket_payload(card) if protocol_response else product_decision_payload(card))
+
+
+def blocking_reason_from_payload(payload: dict) -> BlockingReason | None:
+    reason_ids = payload.get("blocking_reason_ids")
+    if isinstance(reason_ids, list) and reason_ids:
+        reason_id = reason_ids[0]
+    else:
+        reason_id = payload.get("blocking_reason_id")
+    parsed = parse_uuid(str(reason_id)) if reason_id else None
+    if parsed is None:
+        return None
+    return BlockingReason.objects.filter(id=parsed, is_active=True).first()
+
+
+def normalize_field_reports(value) -> list[dict] | None:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        return None
+    normalized = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        field_path = item.get("field_path") or item.get("field_name")
+        message = item.get("message") or item.get("comment")
+        if not field_path or not message:
+            return None
+        severity = item.get("severity", "ERROR")
+        if severity not in {"INFO", "WARNING", "ERROR"}:
+            return None
+        normalized.append({"field_path": str(field_path), "message": str(message), "severity": severity})
+    return normalized
+
+
+def decline_card(request: HttpRequest, *, ticket_id=None, product_id=None, protocol_response: bool) -> JsonResponse:
+    moderator_id = current_moderator_id(request)
+    if moderator_id is None:
+        return error(401, "UNAUTHORIZED", "Moderator identity is required")
+
+    card = find_card(ticket_id=ticket_id, product_id=product_id)
+    if card is None:
+        return error(404, "NOT_FOUND", "Product not found in moderation queue")
+    if card.status == ModerationCard.Status.HARD_BLOCKED:
+        return error(403, "HARD_BLOCKED", "Product is permanently blocked")
+    if card.status != ModerationCard.Status.IN_REVIEW:
+        return error(409, "INVALID_STATUS", "Product is not in review status")
+    if card.assigned_moderator_id != moderator_id:
+        return error(403, "NOT_ASSIGNED", "This moderation card is not assigned to you")
+
+    try:
+        payload = request_json(request)
+    except json.JSONDecodeError:
+        return error(400, "INVALID_JSON", "Request body must be valid JSON")
+
+    reason = blocking_reason_from_payload(payload)
+    if reason is None:
+        return error(400, "UNKNOWN_REASON", "Blocking reason not found")
+    field_reports = normalize_field_reports(payload.get("field_reports"))
+    if field_reports is None:
+        return error(400, "INVALID_FIELD_REPORTS", "field_reports must contain field_path and message")
+
+    old_state = {
+        "status": card.status,
+        "decision_at": card.decision_at,
+        "decision_comment": card.decision_comment,
+        "blocking_reason": card.blocking_reason,
+        "field_reports": card.field_reports,
+    }
+    card.status = ModerationCard.Status.HARD_BLOCKED if reason.hard_block else ModerationCard.Status.BLOCKED
+    card.decision_at = timezone.now()
+    card.decision_comment = str(payload.get("moderator_comment") or payload.get("comment") or "").strip()
+    card.blocking_reason = reason
+    card.field_reports = field_reports
+    card.save(
+        update_fields=[
+            "status",
+            "decision_at",
+            "decision_comment",
+            "blocking_reason",
+            "field_reports",
+            "updated_at",
+        ]
+    )
+
+    event_payload = {
+        "product_id": str(card.product_id),
+        "status": "BLOCKED",
+        "hard_block": reason.hard_block,
+        "blocking_reason": {
+            "id": str(reason.id),
+            "title": reason.title,
+            "comment": card.decision_comment,
+        },
+        "field_reports": field_reports,
+    }
+    try:
+        send_moderation_event(card, event_payload, "BLOCKED")
+    except requests.RequestException:
+        card.status = old_state["status"]
+        card.decision_at = old_state["decision_at"]
+        card.decision_comment = old_state["decision_comment"]
+        card.blocking_reason = old_state["blocking_reason"]
+        card.field_reports = old_state["field_reports"]
+        card.save(
+            update_fields=[
+                "status",
+                "decision_at",
+                "decision_comment",
+                "blocking_reason",
+                "field_reports",
+                "updated_at",
+            ]
+        )
+        return error(500, "B2B_EVENT_FAILED", "Could not deliver moderation decision to B2B")
+
+    return JsonResponse(ticket_payload(card) if protocol_response else product_decision_payload(card))
+
+
+def require_service_key(request: HttpRequest) -> bool:
+    return request.headers.get("X-Service-Key") == settings.SERVICE_KEY
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def product_event(request: HttpRequest) -> JsonResponse:
+    if not require_service_key(request):
+        return error(401, "UNAUTHORIZED", "X-Service-Key is required")
+    try:
+        payload = request_json(request)
+    except json.JSONDecodeError:
+        return error(400, "INVALID_JSON", "Request body must be valid JSON")
+
+    product_id = parse_uuid(str(payload.get("product_id", "")))
+    event_type = str(payload.get("event") or payload.get("type") or payload.get("status") or "").upper()
+    idempotency_key = str(payload.get("idempotency_key") or payload.get("event_id") or "").strip()
+    if product_id is None or not event_type or not idempotency_key:
+        return error(400, "INVALID_REQUEST", "product_id, event and idempotency_key are required")
+    if IncomingProductEvent.objects.filter(idempotency_key=idempotency_key).exists():
+        return JsonResponse({"status": "duplicate_ignored"})
+
+    IncomingProductEvent.objects.create(
+        idempotency_key=idempotency_key,
+        event_type=event_type,
+        product_id=product_id,
+        payload=payload,
+    )
+    card = ModerationCard.objects.filter(product_id=product_id).first()
+
+    if event_type == "DELETED":
+        if card is not None:
+            card.delete()
+        return JsonResponse({"status": "archived"})
+
+    if card is not None and card.status == ModerationCard.Status.HARD_BLOCKED and event_type == "EDITED":
+        return JsonResponse({"status": "ignored_hard_blocked"})
+
+    if event_type == "EDITED" and card is not None:
+        card.status = ModerationCard.Status.PENDING
+        card.assigned_moderator_id = None
+        card.claimed_at = None
+        card.claim_expires_at = None
+        card.json_before = card.json_after
+        card.json_after = payload.get("json_after") or payload.get("product") or card.json_after
+        card.save(
+            update_fields=[
+                "status",
+                "assigned_moderator_id",
+                "claimed_at",
+                "claim_expires_at",
+                "json_before",
+                "json_after",
+                "updated_at",
+            ]
+        )
+    return JsonResponse({"status": "accepted"})
 
 
 @csrf_exempt
@@ -294,3 +469,21 @@ def approve_ticket(request: HttpRequest, ticket_id) -> JsonResponse:
 @require_http_methods(["POST"])
 def approve_product(request: HttpRequest, product_id) -> JsonResponse:
     return approve_card(request, product_id=product_id, protocol_response=False)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def block_ticket(request: HttpRequest, ticket_id) -> JsonResponse:
+    return decline_card(request, ticket_id=ticket_id, protocol_response=True)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def decline_ticket(request: HttpRequest, ticket_id) -> JsonResponse:
+    return decline_card(request, ticket_id=ticket_id, protocol_response=True)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def decline_product(request: HttpRequest, product_id) -> JsonResponse:
+    return decline_card(request, product_id=product_id, protocol_response=False)

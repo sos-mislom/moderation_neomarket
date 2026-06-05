@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -63,3 +64,8 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+SERVICE_KEY = os.getenv("SERVICE_KEY", "dev-service-key")
+B2B_BASE_URL = os.getenv("B2B_BASE_URL", "")
+B2B_SERVICE_KEY = os.getenv("B2B_SERVICE_KEY", "dev-mod-to-b2b-key")
+B2B_TIMEOUT_SECONDS = float(os.getenv("B2B_TIMEOUT_SECONDS", "3"))

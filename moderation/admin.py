@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from django.contrib import admin
 
-from .models import BlockingReason, ModerationCard, OutgoingModerationEvent
+from .models import BlockingReason, IncomingProductEvent, ModerationCard, OutgoingModerationEvent
 
 
 @admin.register(BlockingReason)
@@ -36,3 +36,10 @@ class OutgoingModerationEventAdmin(admin.ModelAdmin):
     list_display = ("event_type", "card", "delivered", "created_at", "delivered_at")
     list_filter = ("event_type", "delivered")
     search_fields = ("idempotency_key", "card__product_id")
+
+
+@admin.register(IncomingProductEvent)
+class IncomingProductEventAdmin(admin.ModelAdmin):
+    list_display = ("event_type", "product_id", "idempotency_key", "created_at")
+    list_filter = ("event_type",)
+    search_fields = ("idempotency_key", "product_id")

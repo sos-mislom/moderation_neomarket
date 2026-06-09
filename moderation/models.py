@@ -79,3 +79,12 @@ class OutgoingModerationEvent(models.Model):
     delivered = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     delivered_at = models.DateTimeField(null=True, blank=True)
+
+
+class IncomingProductEvent(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    idempotency_key = models.CharField(max_length=128, unique=True)
+    event_type = models.CharField(max_length=32)
+    product_id = models.UUIDField()
+    payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)

@@ -54,10 +54,14 @@ def test_approve_transitions_to_moderated_and_emits_event(client, settings, monk
     card.refresh_from_db()
     assert card.status == ModerationCard.Status.MODERATED
     assert card.decision_comment == "ok"
-    assert sent["url"] == "https://b2b.example.test/api/v1/events/moderation"
+    assert sent["url"] == "https://b2b.example.test/api/v1/moderation/events"
     assert sent["headers"]["X-Service-Key"] == settings.B2B_SERVICE_KEY
     assert sent["json"]["product_id"] == str(card.product_id)
-    assert sent["json"]["status"] == "MODERATED"
+    assert sent["json"]["event_type"] == "MODERATED"
+    assert sent["json"]["moderator_id"] == str(moderator_id)
+    assert sent["json"]["moderator_comment"] == "ok"
+    assert "idempotency_key" in sent["json"]
+    assert "occurred_at" in sent["json"]
     assert OutgoingModerationEvent.objects.filter(card=card, event_type="MODERATED", delivered=True).exists()
 
 

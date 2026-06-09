@@ -16,5 +16,6 @@ urlpatterns = [
     path("api/v1/tickets/<uuid:ticket_id>/decline", views.decline_ticket, name="decline-ticket"),
     path("api/v1/products/<uuid:product_id>/approve", views.approve_product, name="approve-product"),
     path("api/v1/products/<uuid:product_id>/decline", views.decline_product, name="decline-product"),
+    path("api/v1/b2b/events", views.product_event, name="b2b-events"),
     path("api/v1/events/product", views.product_event, name="product-event"),
 ]

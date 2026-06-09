@@ -138,7 +138,7 @@ def test_edited_event_on_hard_blocked_is_ignored(client, settings) -> None:
         HTTP_X_SERVICE_KEY=settings.SERVICE_KEY,
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert response.json()["status"] == "ignored_hard_blocked"
     card.refresh_from_db()
     assert card.status == ModerationCard.Status.HARD_BLOCKED
@@ -165,7 +165,7 @@ def test_deleted_event_removes_hard_blocked(client, settings) -> None:
         HTTP_X_SERVICE_KEY=settings.SERVICE_KEY,
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert response.json()["status"] == "archived"
     assert not ModerationCard.objects.filter(id=card.id).exists()
 
@@ -241,3 +241,62 @@ def test_blocked_event_matches_b2b_openapi_request(client, settings, monkeypatch
     assert "blocking_reason" not in sent["json"]
     assert "status" not in sent["json"]
     assert sent["json"]["field_reports"] == [{"field_name": "images[0]", "comment": "bad image"}]
+
+
+@pytest.mark.django_db
+def test_b2b_event_path_accepts_product_edited_for_hard_blocked(client, settings) -> None:
+    card = ModerationCard.objects.create(
+        product_id=uuid.uuid4(),
+        seller_id=uuid.uuid4(),
+        status=ModerationCard.Status.HARD_BLOCKED,
+        json_after={"title": "old", "skus": [{"id": str(uuid.uuid4())}]},
+    )
+
+    response = client.post(
+        "/api/v1/b2b/events",
+        {
+            "idempotency_key": str(uuid.uuid4()),
+            "event_type": "PRODUCT_EDITED",
+            "occurred_at": "2026-06-09T00:00:00Z",
+            "payload": {
+                "product_id": str(card.product_id),
+                "seller_id": str(card.seller_id),
+                "json_before": {"title": "old"},
+                "json_after": {"title": "new"},
+            },
+        },
+        content_type="application/json",
+        HTTP_X_SERVICE_KEY=settings.SERVICE_KEY,
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "ignored_hard_blocked"
+    card.refresh_from_db()
+    assert card.status == ModerationCard.Status.HARD_BLOCKED
+    assert card.json_after["title"] == "old"
+    assert IncomingProductEvent.objects.filter(product_id=card.product_id, event_type="EDITED").exists()
+
+
+@pytest.mark.django_db
+def test_b2b_event_path_accepts_product_deleted_for_hard_blocked(client, settings) -> None:
+    card = ModerationCard.objects.create(
+        product_id=uuid.uuid4(),
+        seller_id=uuid.uuid4(),
+        status=ModerationCard.Status.HARD_BLOCKED,
+    )
+
+    response = client.post(
+        "/api/v1/b2b/events",
+        {
+            "idempotency_key": str(uuid.uuid4()),
+            "event_type": "PRODUCT_DELETED",
+            "occurred_at": "2026-06-09T00:00:00Z",
+            "payload": {"product_id": str(card.product_id)},
+        },
+        content_type="application/json",
+        HTTP_X_SERVICE_KEY=settings.SERVICE_KEY,
+    )
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "archived"
+    assert not ModerationCard.objects.filter(id=card.id).exists()

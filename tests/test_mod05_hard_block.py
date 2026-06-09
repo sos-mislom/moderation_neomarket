@@ -54,9 +54,15 @@ def test_hard_block_transitions_to_terminal_and_emits_event(client, settings, mo
     assert card.status == ModerationCard.Status.HARD_BLOCKED
     assert card.blocking_reason == reason
     assert card.decision_comment == "counterfeit"
-    assert sent["url"] == "https://b2b.example.test/api/v1/events/moderation"
+    assert sent["url"] == "https://b2b.example.test/api/v1/moderation/events"
     assert sent["headers"]["X-Service-Key"] == settings.B2B_SERVICE_KEY
-    assert sent["json"]["status"] == "BLOCKED"
+    assert sent["json"]["event_type"] == "BLOCKED"
+    assert sent["json"]["blocking_reason_id"] == str(reason.id)
+    assert sent["json"]["moderator_id"] == str(moderator_id)
+    assert sent["json"]["moderator_comment"] == "counterfeit"
+    assert sent["json"]["field_reports"] == []
+    assert "idempotency_key" in sent["json"]
+    assert "occurred_at" in sent["json"]
     assert OutgoingModerationEvent.objects.filter(card=card, event_type="BLOCKED", delivered=True).exists()
 
 
@@ -79,7 +85,9 @@ def test_hard_block_event_carries_hard_block_true(client) -> None:
     assert payload["status"] == "HARD_BLOCKED"
     event = OutgoingModerationEvent.objects.get(card=card, event_type="BLOCKED")
     assert event.payload["hard_block"] is True
-    assert event.payload["blocking_reason"]["id"] == str(reason.id)
+    assert event.payload["event_type"] == "BLOCKED"
+    assert event.payload["blocking_reason_id"] == str(reason.id)
+    assert "occurred_at" in event.payload
 
 
 @pytest.mark.django_db
@@ -182,3 +190,54 @@ def test_soft_reason_routes_to_blocked_not_hard_blocked(client) -> None:
     assert response.json()["status"] == "BLOCKED"
     card.refresh_from_db()
     assert card.field_reports == [{"field_path": "description", "message": "too short", "severity": "ERROR"}]
+    event = OutgoingModerationEvent.objects.get(card=card, event_type="BLOCKED")
+    assert event.payload["field_reports"] == [{"field_name": "description", "comment": "too short"}]
+
+
+@pytest.mark.django_db
+def test_blocked_event_matches_b2b_openapi_request(client, settings, monkeypatch) -> None:
+    moderator_id = uuid.uuid4()
+    card = make_review_card(moderator_id)
+    reason = BlockingReason.objects.get(code="COUNTERFEIT")
+    sent = {}
+    settings.B2B_BASE_URL = "https://b2b.example.test"
+
+    class Response:
+        status_code = 200
+
+    def fake_post(url, json, headers, timeout):
+        sent["url"] = url
+        sent["json"] = json
+        return Response()
+
+    monkeypatch.setattr("moderation.views.requests.post", fake_post)
+
+    response = client.post(
+        f"/api/v1/products/{card.product_id}/decline",
+        {
+            "blocking_reason_id": str(reason.id),
+            "moderator_comment": "counterfeit",
+            "field_reports": [{"field_path": "images[0]", "message": "bad image"}],
+        },
+        content_type="application/json",
+        HTTP_X_MODERATOR_ID=str(moderator_id),
+    )
+
+    assert response.status_code == 200
+    assert sent["url"].endswith("/api/v1/moderation/events")
+    assert {
+        "idempotency_key",
+        "product_id",
+        "event_type",
+        "occurred_at",
+        "moderator_id",
+        "moderator_comment",
+        "blocking_reason_id",
+        "hard_block",
+        "field_reports",
+    } <= set(sent["json"])
+    assert sent["json"]["event_type"] == "BLOCKED"
+    assert sent["json"]["blocking_reason_id"] == str(reason.id)
+    assert "blocking_reason" not in sent["json"]
+    assert "status" not in sent["json"]
+    assert sent["json"]["field_reports"] == [{"field_name": "images[0]", "comment": "bad image"}]

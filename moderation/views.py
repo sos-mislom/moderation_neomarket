@@ -130,13 +130,20 @@ def find_card(*, ticket_id=None, product_id=None) -> ModerationCard | None:
 
 def send_moderation_event(card: ModerationCard, payload: dict, event_type: str) -> OutgoingModerationEvent:
     event = OutgoingModerationEvent.objects.create(card=card, event_type=event_type, payload=payload)
+    request_payload = {
+        **payload,
+        "idempotency_key": str(event.idempotency_key),
+        "occurred_at": timezone.now().isoformat(),
+    }
+    event.payload = request_payload
+    event.save(update_fields=["payload"])
     if not settings.B2B_BASE_URL:
         return event
 
-    url = f"{settings.B2B_BASE_URL.rstrip('/')}/api/v1/events/moderation"
+    url = f"{settings.B2B_BASE_URL.rstrip('/')}/api/v1/moderation/events"
     response = requests.post(
         url,
-        json={**payload, "idempotency_key": str(event.idempotency_key)},
+        json=request_payload,
         headers={"X-Service-Key": settings.B2B_SERVICE_KEY},
         timeout=settings.B2B_TIMEOUT_SECONDS,
     )
@@ -191,7 +198,12 @@ def approve_card(request: HttpRequest, *, ticket_id=None, product_id=None, proto
         ]
     )
 
-    event_payload = {"product_id": str(card.product_id), "status": "MODERATED"}
+    event_payload = {
+        "product_id": str(card.product_id),
+        "event_type": "MODERATED",
+        "moderator_id": str(card.assigned_moderator_id) if card.assigned_moderator_id else None,
+        "moderator_comment": card.decision_comment or None,
+    }
     try:
         send_moderation_event(card, event_payload, "MODERATED")
     except requests.RequestException:
@@ -247,6 +259,17 @@ def normalize_field_reports(value) -> list[dict] | None:
     return normalized
 
 
+def b2b_field_reports(field_reports: list[dict]) -> list[dict]:
+    return [
+        {
+            "field_name": report["field_path"],
+            "comment": report["message"],
+            **({"sku_id": report["sku_id"]} if report.get("sku_id") else {}),
+        }
+        for report in field_reports
+    ]
+
+
 def decline_card(request: HttpRequest, *, ticket_id=None, product_id=None, protocol_response: bool) -> JsonResponse:
     moderator_id = current_moderator_id(request)
     if moderator_id is None:
@@ -299,14 +322,12 @@ def decline_card(request: HttpRequest, *, ticket_id=None, product_id=None, proto
 
     event_payload = {
         "product_id": str(card.product_id),
-        "status": "BLOCKED",
+        "event_type": "BLOCKED",
+        "moderator_id": str(card.assigned_moderator_id) if card.assigned_moderator_id else None,
+        "moderator_comment": card.decision_comment or None,
+        "blocking_reason_id": str(reason.id),
         "hard_block": reason.hard_block,
-        "blocking_reason": {
-            "id": str(reason.id),
-            "title": reason.title,
-            "comment": card.decision_comment,
-        },
-        "field_reports": field_reports,
+        "field_reports": b2b_field_reports(field_reports),
     }
     try:
         send_moderation_event(card, event_payload, "BLOCKED")

@@ -27,6 +27,10 @@ class BlockingReason(models.Model):
 
 
 class ModerationCard(models.Model):
+    class Kind(models.TextChoices):
+        CREATE = "CREATE"
+        EDIT = "EDIT"
+
     class Status(models.TextChoices):
         PENDING = "PENDING"
         IN_REVIEW = "IN_REVIEW"
@@ -36,7 +40,19 @@ class ModerationCard(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     product_id = models.UUIDField()
+    seller_id = models.UUIDField(null=True, blank=True)
+    category_id = models.UUIDField(null=True, blank=True)
+    kind = models.CharField(max_length=16, choices=Kind.choices, default=Kind.CREATE)
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.PENDING)
+    queue_priority = models.PositiveSmallIntegerField(default=1)
+    assigned_moderator_id = models.UUIDField(null=True, blank=True)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    claim_expires_at = models.DateTimeField(null=True, blank=True)
+    decision_at = models.DateTimeField(null=True, blank=True)
+    decision_comment = models.TextField(blank=True)
+    json_before = models.JSONField(null=True, blank=True)
+    json_after = models.JSONField(default=dict, blank=True)
+    field_reports = models.JSONField(default=list, blank=True)
     blocking_reason = models.ForeignKey(
         BlockingReason,
         null=True,
@@ -46,3 +62,20 @@ class ModerationCard(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["product_id"]),
+            models.Index(fields=["status", "queue_priority", "created_at"]),
+        ]
+
+
+class OutgoingModerationEvent(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    idempotency_key = models.UUIDField(default=uuid.uuid4, unique=True)
+    card = models.ForeignKey(ModerationCard, on_delete=models.CASCADE, related_name="outgoing_events")
+    event_type = models.CharField(max_length=32)
+    payload = models.JSONField(default=dict)
+    delivered = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)

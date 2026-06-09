@@ -356,6 +356,20 @@ def require_service_key(request: HttpRequest) -> bool:
     return request.headers.get("X-Service-Key") == settings.SERVICE_KEY
 
 
+def normalize_incoming_event(payload: dict) -> tuple[str, str, uuid.UUID | None, dict]:
+    event_type = str(payload.get("event_type") or payload.get("event") or payload.get("type") or payload.get("status") or "").upper()
+    event_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+    product_id = parse_uuid(str(event_payload.get("product_id", "")))
+    idempotency_key = str(payload.get("idempotency_key") or payload.get("event_id") or "").strip()
+
+    aliases = {
+        "PRODUCT_CREATED": "CREATED",
+        "PRODUCT_EDITED": "EDITED",
+        "PRODUCT_DELETED": "DELETED",
+    }
+    return aliases.get(event_type, event_type), idempotency_key, product_id, event_payload
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def product_event(request: HttpRequest) -> JsonResponse:
@@ -366,13 +380,11 @@ def product_event(request: HttpRequest) -> JsonResponse:
     except json.JSONDecodeError:
         return error(400, "INVALID_JSON", "Request body must be valid JSON")
 
-    product_id = parse_uuid(str(payload.get("product_id", "")))
-    event_type = str(payload.get("event") or payload.get("type") or payload.get("status") or "").upper()
-    idempotency_key = str(payload.get("idempotency_key") or payload.get("event_id") or "").strip()
+    event_type, idempotency_key, product_id, event_payload = normalize_incoming_event(payload)
     if product_id is None or not event_type or not idempotency_key:
         return error(400, "INVALID_REQUEST", "product_id, event and idempotency_key are required")
     if IncomingProductEvent.objects.filter(idempotency_key=idempotency_key).exists():
-        return JsonResponse({"status": "duplicate_ignored"})
+        return JsonResponse({"status": "duplicate_ignored"}, status=202)
 
     IncomingProductEvent.objects.create(
         idempotency_key=idempotency_key,
@@ -385,10 +397,10 @@ def product_event(request: HttpRequest) -> JsonResponse:
     if event_type == "DELETED":
         if card is not None:
             card.delete()
-        return JsonResponse({"status": "archived"})
+        return JsonResponse({"status": "archived"}, status=202)
 
     if card is not None and card.status == ModerationCard.Status.HARD_BLOCKED and event_type == "EDITED":
-        return JsonResponse({"status": "ignored_hard_blocked"})
+        return JsonResponse({"status": "ignored_hard_blocked"}, status=202)
 
     if event_type == "EDITED" and card is not None:
         card.status = ModerationCard.Status.PENDING
@@ -396,7 +408,7 @@ def product_event(request: HttpRequest) -> JsonResponse:
         card.claimed_at = None
         card.claim_expires_at = None
         card.json_before = card.json_after
-        card.json_after = payload.get("json_after") or payload.get("product") or card.json_after
+        card.json_after = event_payload.get("json_after") or event_payload.get("product") or card.json_after
         card.save(
             update_fields=[
                 "status",
@@ -408,7 +420,7 @@ def product_event(request: HttpRequest) -> JsonResponse:
                 "updated_at",
             ]
         )
-    return JsonResponse({"status": "accepted"})
+    return JsonResponse({"status": "accepted"}, status=202)
 
 
 @csrf_exempt
